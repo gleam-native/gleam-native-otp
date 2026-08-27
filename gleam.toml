@@ -16,9 +16,8 @@ links = [
 ]
 
 [dependencies]
-gleam_stdlib = ">= 0.60.0 and < 2.0.0"
-gleam_erlang = ">= 1.0.0 and < 2.0.0"
+gleam_stdlib = { path = "../gleam-stdlib-native" }
+gleam_erlang = { path = "../gleam-native-erlang" }
 
 [dev-dependencies]
-gleeunit = ">= 1.0.0 and < 2.0.0"
-logging = ">= 1.3.0 and < 2.0.0"
+gleeunit = { path = "../gleam-native-gleeunit" }

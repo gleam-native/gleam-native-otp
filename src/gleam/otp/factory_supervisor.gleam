@@ -94,7 +94,9 @@
 
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
-import gleam/erlang/process.{type Pid}
+import gleam/erlang/process.{
+  type ExitMessage, type Pid, Abnormal, ExitMessage, Normal,
+}
 import gleam/list
 import gleam/option
 import gleam/otp/actor
@@ -123,9 +125,11 @@ pub opaque type Supervisor(child_argument, child_data) {
 /// used.
 type SupervisorHandle
 
+@target(erlang)
 @external(erlang, "gleam_otp_external", "identity")
 fn pid_to_supervisor_handle(pid: Pid) -> SupervisorHandle
 
+@target(erlang)
 @external(erlang, "gleam_otp_external", "identity")
 fn name_to_supervisor_handle(
   name: process.Name(Message(child_argument, child_data)),
@@ -148,10 +152,18 @@ pub type Message(child_argument, child_data)
 /// when they are called. Always make sure your supervisors are themselves
 /// supervised.
 ///
+@target(erlang)
 pub fn get_by_name(
   name: process.Name(Message(child_argument, child_data)),
 ) -> Supervisor(child_argument, child_data) {
   Supervisor(name_to_supervisor_handle(name))
+}
+
+@target(native)
+pub fn get_by_name(
+  name: process.Name(Message(child_argument, child_data)),
+) -> Supervisor(child_argument, child_data) {
+  Supervisor(coerce(process.named_subject(name)))
 }
 
 /// A builder for configuring and starting a supervisor. See each of the
@@ -286,6 +298,7 @@ pub fn restart_strategy(
 /// The supervisor will be linked to the parent process that calls this
 /// function.
 ///
+@target(erlang)
 pub fn start(
   builder: Builder(child_argument, child_data),
 ) -> actor.StartResult(Supervisor(child_argument, child_data)) {
@@ -329,6 +342,7 @@ pub fn start(
   }
 }
 
+@target(erlang)
 @external(erlang, "maps", "from_list")
 fn make_erlang_start_flags(
   flags: List(ErlangStartFlag(data)),
@@ -336,15 +350,18 @@ fn make_erlang_start_flags(
 
 type ErlangStartFlags
 
+@target(erlang)
 @external(erlang, "gleam_otp_external", "convert_erlang_start_error")
 fn convert_erlang_start_error(dynamic: Dynamic) -> actor.StartError
 
+@target(erlang)
 @external(erlang, "supervisor", "start_link")
 fn unnamed_start(
   module: Atom,
   args: #(ErlangStartFlags, List(ErlangChildSpec)),
 ) -> Result(Pid, Dynamic)
 
+@target(erlang)
 @external(erlang, "supervisor", "start_link")
 fn named_start(
   name: ErlangSupervisorName(child_argument, child_data),
@@ -368,6 +385,7 @@ type ErlangStartFlag(data) {
 
 type ErlangChildSpec
 
+@target(erlang)
 @external(erlang, "maps", "from_list")
 fn make_erlang_child_spec(
   properties: List(ErlangChildSpecProperty(argument, data)),
@@ -390,6 +408,7 @@ type ErlangChildSpecProperty(argument, data) {
 type Timeout
 
 /// Negative numbers mean an infinite timeout
+@target(erlang)
 @external(erlang, "gleam_otp_external", "make_timeout")
 fn make_timeout(amount: Int) -> Timeout
 
@@ -411,6 +430,7 @@ pub fn supervised(
 /// Start a new child using the supervisor's child template and the given
 /// argument. The start result of the child is returned.
 ///
+@target(erlang)
 pub fn start_child(
   supervisor: Supervisor(child_argument, child_data),
   argument: child_argument,
@@ -421,6 +441,16 @@ pub fn start_child(
   }
 }
 
+@target(native)
+pub fn start_child(
+  supervisor: Supervisor(child_argument, child_data),
+  argument: child_argument,
+) -> actor.StartResult(child_data) {
+  process.call_forever(handle_subject(supervisor), fn(reply) {
+    coerce(NativeStartChild(argument, reply))
+  })
+}
+
 /// Returns the number of children under the supervisor.
 ///
 /// This function runs the same speed regardless of how many children the
@@ -429,15 +459,25 @@ pub fn start_child(
 /// If the supervisor is heavily overloaded this number could be inaccurate due
 /// to the supervisor still processing the termination of some of its children.
 ///
+@target(erlang)
 pub fn count_children(factory: Supervisor(child_argument, child_data)) -> Int {
   erlang_count_children(factory.handle)
   |> list.key_find(atom.create("active"))
   |> result.unwrap(0)
 }
 
+@target(native)
+pub fn count_children(factory: Supervisor(child_argument, child_data)) -> Int {
+  process.call_forever(handle_subject(factory), fn(reply) {
+    coerce(NativeCountChildren(reply))
+  })
+}
+
+@target(erlang)
 @external(erlang, "supervisor", "count_children")
 fn erlang_count_children(supervisor: SupervisorHandle) -> List(#(Atom, Int))
 
+@target(erlang)
 @external(erlang, "supervisor", "start_child")
 fn erlang_start_child(
   supervisor: SupervisorHandle,
@@ -445,12 +485,14 @@ fn erlang_start_child(
 ) -> Result2(Pid, data, actor.StartError)
 
 // Callback used by the Erlang supervisor module.
+@target(erlang)
 @internal
 pub fn init(start_data: Dynamic) -> Result(Dynamic, never) {
   Ok(start_data)
 }
 
 // Callback used by the Erlang supervisor module.
+@target(erlang)
 @internal
 pub fn start_child_callback(
   start: fn(argument) -> Result(actor.Started(data), actor.StartError),
@@ -459,5 +501,231 @@ pub fn start_child_callback(
   case start(argument) {
     Ok(started) -> result2.Ok(started.pid, started.data)
     Error(error) -> result2.Error(error)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The native target's implementation: the supervisor is a process holding
+// the child template, addressed through a subject stored (coerced) in the
+// `SupervisorHandle`. Its message protocol is the private
+// `NativeFactoryMessage` type, coerced through the public opaque
+// `Message` type.
+
+@target(native)
+@external(erlang, "gleam_otp_external", "identity")
+@external(native, "runtime", "gleam_native_identity")
+fn coerce(value: a) -> b
+
+@target(native)
+@external(native, "runtime", "gleam_native_process_monotonic_ms")
+fn monotonic_ms() -> Int
+
+@target(native)
+@external(native, "runtime", "gleam_native_process_exit_self")
+fn exit_self(reason: String) -> Nil
+
+@target(native)
+type NativeFactoryMessage(child_argument, child_data) {
+  NativeStartChild(
+    argument: child_argument,
+    reply: process.Subject(actor.StartResult(child_data)),
+  )
+  NativeCountChildren(reply: process.Subject(Int))
+}
+
+@target(native)
+fn handle_subject(
+  supervisor: Supervisor(child_argument, child_data),
+) -> process.Subject(NativeFactoryMessage(child_argument, child_data)) {
+  coerce(supervisor.handle)
+}
+
+@target(native)
+pub fn start(
+  builder: Builder(child_argument, child_data),
+) -> actor.StartResult(Supervisor(child_argument, child_data)) {
+  let ack = process.new_subject()
+  let pid = process.spawn(fn() { initialise(builder, ack) })
+  case process.receive_forever(ack) {
+    Ok(subject) -> Ok(actor.Started(pid:, data: Supervisor(coerce(subject))))
+    Error(error) -> Error(error)
+  }
+}
+
+@target(native)
+type NativeState(child_argument, child_data) {
+  NativeState(
+    builder: Builder(child_argument, child_data),
+    subject: process.Subject(NativeFactoryMessage(child_argument, child_data)),
+    /// Running children with the argument each was started from.
+    children: List(#(Pid, child_argument)),
+    /// Monotonic timestamps (milliseconds) of recent restarts.
+    restarts: List(Int),
+  )
+}
+
+@target(native)
+type Incoming(child_argument, child_data) {
+  Api(NativeFactoryMessage(child_argument, child_data))
+  Exit(ExitMessage)
+}
+
+@target(native)
+fn initialise(
+  builder: Builder(child_argument, child_data),
+  ack: process.Subject(
+    Result(
+      process.Subject(NativeFactoryMessage(child_argument, child_data)),
+      actor.StartError,
+    ),
+  ),
+) -> Nil {
+  process.trap_exits(True)
+  let registration = case builder.name {
+    option.None -> Ok(process.new_subject())
+    option.Some(name) ->
+      case process.register(process.self(), name) {
+        Ok(Nil) -> Ok(coerce(process.named_subject(name)))
+        Error(_) -> Error(actor.InitFailed("already started"))
+      }
+  }
+  case registration {
+    Ok(subject) -> {
+      process.send(ack, Ok(subject))
+      loop(NativeState(builder:, subject:, children: [], restarts: []))
+    }
+    Error(error) -> {
+      process.send(ack, Error(error))
+      Nil
+    }
+  }
+}
+
+@target(native)
+fn loop(state: NativeState(child_argument, child_data)) -> Nil {
+  let message =
+    process.new_selector()
+    |> process.select_map(state.subject, Api)
+    |> process.select_trapped_exits(Exit)
+    |> process.selector_receive_forever
+  case message {
+    Api(NativeStartChild(argument, reply)) ->
+      case state.builder.template(argument) {
+        Ok(started) -> {
+          process.send(reply, Ok(started))
+          loop(
+            NativeState(..state, children: [
+              #(started.pid, argument),
+              ..state.children
+            ]),
+          )
+        }
+        Error(error) -> {
+          process.send(reply, Error(error))
+          loop(state)
+        }
+      }
+    Api(NativeCountChildren(reply)) -> {
+      process.send(reply, list.length(state.children))
+      loop(state)
+    }
+    Exit(ExitMessage(pid, reason)) -> handle_exit(state, pid, reason)
+  }
+}
+
+@target(native)
+fn handle_exit(
+  state: NativeState(child_argument, child_data),
+  pid: Pid,
+  reason: process.ExitReason,
+) -> Nil {
+  case list.key_find(state.children, pid) {
+    // An exit signal from something that is not a child: the parent (or
+    // another linked process) telling the supervisor to shut down.
+    Error(Nil) -> terminate(state, reason)
+
+    Ok(argument) -> {
+      let children = list.filter(state.children, fn(child) { child.0 != pid })
+      let state = NativeState(..state, children: children)
+      case should_restart(state.builder.restart_strategy, reason) {
+        False -> loop(state)
+        True -> {
+          let state =
+            NativeState(..state, restarts: [monotonic_ms(), ..state.restarts])
+          case within_intensity(state) {
+            False -> terminate(state, Abnormal(dynamic.string("shutdown")))
+            True ->
+              case state.builder.template(argument) {
+                Ok(started) ->
+                  loop(
+                    NativeState(..state, children: [
+                      #(started.pid, argument),
+                      ..state.children
+                    ]),
+                  )
+                Error(_) ->
+                  terminate(state, Abnormal(dynamic.string("shutdown")))
+              }
+          }
+        }
+      }
+    }
+  }
+}
+
+@target(native)
+fn should_restart(
+  restart: supervision.Restart,
+  reason: process.ExitReason,
+) -> Bool {
+  case restart {
+    supervision.Permanent -> True
+    supervision.Temporary -> False
+    supervision.Transient ->
+      case reason {
+        Normal -> False
+        _ -> reason != Abnormal(dynamic.string("shutdown"))
+      }
+  }
+}
+
+@target(native)
+fn within_intensity(state: NativeState(child_argument, child_data)) -> Bool {
+  let cutoff = monotonic_ms() - state.builder.period * 1000
+  let recent = list.filter(state.restarts, fn(timestamp) { timestamp > cutoff })
+  list.length(recent) <= state.builder.intensity
+}
+
+@target(native)
+fn terminate(
+  state: NativeState(child_argument, child_data),
+  reason: process.ExitReason,
+) -> Nil {
+  let timeout = case state.builder.child_type {
+    supervision.Worker(shutdown_ms) -> shutdown_ms
+    supervision.Supervisor -> 5000
+  }
+  list.each(state.children, fn(child) {
+    process.send_abnormal_exit(child.0, "shutdown")
+    await_exit(child.0, timeout)
+  })
+  case reason {
+    Normal -> Nil
+    _ -> exit_self("shutdown")
+  }
+}
+
+@target(native)
+fn await_exit(pid: Pid, timeout: Int) -> Nil {
+  let selector =
+    process.new_selector()
+    |> process.select_trapped_exits(fn(exit) { exit })
+  case process.selector_receive(selector, timeout) {
+    Ok(ExitMessage(from, _)) if from == pid -> Nil
+    Ok(_other) -> await_exit(pid, timeout)
+    Error(Nil) -> {
+      process.kill(pid)
+      Nil
+    }
   }
 }

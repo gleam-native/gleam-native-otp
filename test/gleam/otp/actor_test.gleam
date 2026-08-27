@@ -25,9 +25,11 @@ pub fn get_state_test() {
   |> should.equal(dynamic.string("Test state"))
 }
 
+@target(erlang)
 @external(erlang, "sys", "get_status")
 fn get_status(a: Pid) -> Dynamic
 
+@target(erlang)
 pub fn get_status_test() {
   let assert Ok(actor) =
     actor.new(Nil)
@@ -244,7 +246,7 @@ pub fn replace_selector_test() {
   process.send(str_subj, "test 4")
   // Check state
   process.call(actor.data, 50, GetText)
-  |> should.equal("unknown message: Array")
+  |> should.equal("unknown message: " <> unmatched_classification())
 }
 
 pub fn abnormal_exit_can_be_trapped_test() {
@@ -322,6 +324,16 @@ pub fn abnormal_stop_exits_linked_test() {
   )
 }
 
+@target(erlang)
+fn unmatched_classification() -> String {
+  "Array"
+}
+
+@target(native)
+fn unmatched_classification() -> String {
+  "String"
+}
+
 fn mapped_selector(
   selector: process.Selector(ActorMessage),
   mapper: fn(a) -> ActorMessage,
@@ -337,11 +349,25 @@ fn mapped_selector(
   #(subject, selector)
 }
 
+@target(erlang)
 @external(erlang, "erlang", "send")
 fn raw_send(a: Pid, b: anything) -> anything
 
+@target(native)
+fn raw_send(a: Pid, b: anything) -> Bool {
+  process.send_raw_tagged(a, 15, b)
+}
+
+@target(erlang)
 @external(erlang, "logger", "set_primary_config")
 fn logger_set_primary_config(a: Atom, b: Atom) -> Nil
+
+@target(native)
+fn logger_set_primary_config(a: Atom, b: Atom) -> Nil {
+  let _ = a
+  let _ = b
+  Nil
+}
 
 pub fn named_new_test() {
   let name = process.new_name("my_actor")

@@ -22,7 +22,10 @@
 
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
-import gleam/erlang/process.{type Pid}
+import gleam/erlang/process.{
+  type ExitMessage, type Pid, Abnormal, ExitMessage, Normal,
+}
+import gleam/option.{type Option, None, Some}
 import gleam/list
 import gleam/otp/actor
 import gleam/otp/supervision.{type ChildSpecification}
@@ -156,6 +159,7 @@ pub fn auto_shutdown(builder: Builder, value: AutoShutdown) -> Builder {
 /// started child processes with reason shutdown and then terminate itself and
 /// returns an error.
 ///
+@target(erlang)
 pub fn start(
   builder: Builder,
 ) -> Result(actor.Started(Supervisor), actor.StartError) {
@@ -189,9 +193,11 @@ pub fn supervised(builder: Builder) -> ChildSpecification(Supervisor) {
   supervision.supervisor(fn() { start(builder) })
 }
 
+@target(erlang)
 @external(erlang, "gleam_otp_external", "convert_erlang_start_error")
 fn convert_erlang_start_error(dynamic: Dynamic) -> actor.StartError
 
+@target(erlang)
 @external(erlang, "supervisor", "start_link")
 fn erlang_start_link(
   module: Atom,
@@ -206,6 +212,7 @@ pub fn add(builder: Builder, child: ChildSpecification(data)) -> Builder {
   ])
 }
 
+@target(erlang)
 fn convert_child(child: ChildSpecification(data), id: Int) -> ErlangChildSpec {
   let mfa = #(
     atom.create("gleam@otp@static_supervisor"),
@@ -230,6 +237,7 @@ fn convert_child(child: ChildSpecification(data), id: Int) -> ErlangChildSpec {
 
 type ErlangStartFlags
 
+@target(erlang)
 @external(erlang, "maps", "from_list")
 fn make_erlang_start_flags(
   flags: List(ErlangStartFlag(data)),
@@ -244,6 +252,7 @@ type ErlangStartFlag(data) {
 
 type ErlangChildSpec
 
+@target(erlang)
 @external(erlang, "maps", "from_list")
 fn make_erlang_child_spec(
   properties: List(ErlangChildSpecProperty(data)),
@@ -263,16 +272,19 @@ type ErlangChildSpecProperty(data) {
 type Timeout
 
 /// Negative numbers mean an infinite timeout
+@target(erlang)
 @external(erlang, "gleam_otp_external", "make_timeout")
 fn make_timeout(amount: Int) -> Timeout
 
 // Callback used by the Erlang supervisor module.
+@target(erlang)
 @internal
 pub fn init(start_data: Dynamic) -> Result(Dynamic, never) {
   Ok(start_data)
 }
 
 // Callback used by the Erlang supervisor module.
+@target(erlang)
 @internal
 pub fn start_child_callback(
   start: fn() -> Result(actor.Started(anything), actor.StartError),
@@ -280,5 +292,310 @@ pub fn start_child_callback(
   case start() {
     Ok(started) -> Ok(started.pid)
     Error(error) -> Error(error)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The native target's implementation: a pure Gleam supervisor over
+// `gleam/erlang/process`, with the same behavior as Erlang/OTP's
+// `supervisor` module — ordered starts, the three restart strategies,
+// per-child restart kinds, shutdown timeouts with escalation to kill, and
+// restart-intensity limits.
+
+@target(native)
+@external(native, "runtime", "gleam_native_process_monotonic_ms")
+fn monotonic_ms() -> Int
+
+@target(native)
+@external(native, "runtime", "gleam_native_process_exit_self")
+fn exit_self(reason: String) -> Nil
+
+@target(native)
+pub fn start(
+  builder: Builder,
+) -> Result(actor.Started(Supervisor), actor.StartError) {
+  let ack = process.new_subject()
+  let pid = process.spawn(fn() { initialise(builder, ack) })
+  case process.receive_forever(ack) {
+    Ok(Nil) -> Ok(actor.Started(pid: pid, data: Supervisor(pid)))
+    Error(error) -> Error(error)
+  }
+}
+
+/// One child slot: its specification and the pid it is currently running
+/// as, if it is running.
+@target(native)
+type Tracked {
+  Tracked(specification: ChildSpecification(Nil), pid: Option(Pid))
+}
+
+@target(native)
+type State {
+  State(
+    strategy: Strategy,
+    intensity: Int,
+    period: Int,
+    children: List(Tracked),
+    /// Monotonic timestamps (milliseconds) of recent restarts, newest
+    /// first, for the intensity window.
+    restarts: List(Int),
+    /// Exit messages received while waiting for a specific child to shut
+    /// down, to be handled by the main loop.
+    pending: List(ExitMessage),
+  )
+}
+
+@target(native)
+fn initialise(
+  builder: Builder,
+  ack: process.Subject(Result(Nil, actor.StartError)),
+) -> Nil {
+  process.trap_exits(True)
+  let specifications = list.reverse(builder.children)
+  case start_children(specifications, []) {
+    Ok(children) -> {
+      process.send(ack, Ok(Nil))
+      loop(State(
+        strategy: builder.strategy,
+        intensity: builder.intensity,
+        period: builder.period,
+        children: children,
+        restarts: [],
+        pending: [],
+      ))
+    }
+    Error(#(error, started)) -> {
+      // Stop what did start, in reverse start order, then report failure.
+      let _pending = list.fold(started, [], shutdown_child)
+      process.send(ack, Error(error))
+      Nil
+    }
+  }
+}
+
+@target(native)
+fn start_children(
+  specifications: List(ChildSpecification(Nil)),
+  started: List(Tracked),
+) -> Result(List(Tracked), #(actor.StartError, List(Tracked))) {
+  case specifications {
+    [] -> Ok(list.reverse(started))
+    [specification, ..rest] ->
+      case specification.start() {
+        Ok(child) ->
+          start_children(rest, [
+            Tracked(specification, Some(child.pid)),
+            ..started
+          ])
+        Error(error) -> Error(#(error, started))
+      }
+  }
+}
+
+@target(native)
+fn loop(state: State) -> Nil {
+  case state.pending {
+    [exit, ..rest] -> handle_exit(State(..state, pending: rest), exit)
+    [] -> {
+      let exit =
+        process.new_selector()
+        |> process.select_trapped_exits(fn(exit) { exit })
+        |> process.selector_receive_forever
+      handle_exit(state, exit)
+    }
+  }
+}
+
+@target(native)
+fn handle_exit(state: State, exit: ExitMessage) -> Nil {
+  let ExitMessage(pid, reason) = exit
+  let position =
+    list.index_map(state.children, fn(child, index) { #(index, child) })
+    |> list.find(fn(entry) { { entry.1 }.pid == Some(pid) })
+  case position {
+    // An exit signal that is not from a running child: the parent (or
+    // another linked process) telling the supervisor to shut down.
+    Error(Nil) -> terminate(state, reason)
+
+    Ok(#(index, child)) -> {
+      let state = mark_stopped(state, index)
+      case should_restart(child.specification, reason) {
+        False -> loop(state)
+        True -> {
+          let state =
+            State(..state, restarts: [monotonic_ms(), ..state.restarts])
+          case within_intensity(state) {
+            False -> terminate(state, Abnormal(dynamic.string("shutdown")))
+            True ->
+              case restart(state, index) {
+                Ok(state) -> loop(state)
+                Error(_) ->
+                  terminate(state, Abnormal(dynamic.string("shutdown")))
+              }
+          }
+        }
+      }
+    }
+  }
+}
+
+@target(native)
+fn mark_stopped(state: State, index: Int) -> State {
+  let children =
+    list.index_map(state.children, fn(child, position) {
+      case position == index {
+        True -> Tracked(..child, pid: None)
+        False -> child
+      }
+    })
+  State(..state, children: children)
+}
+
+@target(native)
+fn should_restart(
+  specification: ChildSpecification(Nil),
+  reason: process.ExitReason,
+) -> Bool {
+  case specification.restart {
+    supervision.Permanent -> True
+    supervision.Temporary -> False
+    supervision.Transient ->
+      case reason {
+        Normal -> False
+        _ -> reason != Abnormal(dynamic.string("shutdown"))
+      }
+  }
+}
+
+@target(native)
+fn within_intensity(state: State) -> Bool {
+  let cutoff = monotonic_ms() - state.period * 1000
+  let recent = list.filter(state.restarts, fn(timestamp) { timestamp > cutoff })
+  list.length(recent) <= state.intensity
+}
+
+/// Restarts after the child at `index` failed, per the strategy: the
+/// child alone, it and everything after it, or every child.
+@target(native)
+fn restart(state: State, index: Int) -> Result(State, Nil) {
+  let from = case state.strategy {
+    OneForOne -> index
+    RestForOne -> index
+    OneForAll -> 0
+  }
+  let only_failed = state.strategy == OneForOne
+  // Stop the other children implicated by the strategy, in reverse start
+  // order; buffered exits from the shutdowns join the pending list.
+  let indexed = list.index_map(state.children, fn(child, i) { #(i, child) })
+  let to_stop = case only_failed {
+    True -> []
+    False ->
+      list.filter(indexed, fn(entry) { entry.0 >= from && entry.0 != index })
+      |> list.reverse
+  }
+  let pending =
+    list.fold(to_stop, state.pending, fn(pending, entry) {
+      case { entry.1 }.pid {
+        Some(pid) -> shutdown_tracked(pending, pid, { entry.1 }.specification)
+        None -> pending
+      }
+    })
+  // Restart the implicated children in start order.
+  let children =
+    list.index_map(state.children, fn(child, i) {
+      let implicated = case only_failed {
+        True -> i == index
+        False -> i >= from
+      }
+      case implicated {
+        False -> Ok(child)
+        True ->
+          case child.specification.start() {
+            Ok(started) -> Ok(Tracked(..child, pid: Some(started.pid)))
+            Error(_) -> Error(Nil)
+          }
+      }
+    })
+  let state = State(..state, pending: pending)
+  // Any failed restart aborts the supervisor.
+  case list.try_map(children, fn(child) { child }) {
+    Ok(children) -> Ok(State(..state, children: children))
+    Error(Nil) -> Error(Nil)
+  }
+}
+
+/// Shuts every child down (in reverse start order) and exits with the
+/// given reason.
+@target(native)
+fn terminate(state: State, reason: process.ExitReason) -> Nil {
+  let _pending =
+    list.reverse(state.children)
+    |> list.fold(state.pending, fn(pending, child) {
+      case child.pid {
+        Some(pid) -> shutdown_tracked(pending, pid, child.specification)
+        None -> pending
+      }
+    })
+  case reason {
+    Normal -> Nil
+    _ -> exit_self("shutdown")
+  }
+}
+
+@target(native)
+fn shutdown_child(
+  pending: List(ExitMessage),
+  child: Tracked,
+) -> List(ExitMessage) {
+  case child.pid {
+    Some(pid) -> shutdown_tracked(pending, pid, child.specification)
+    None -> pending
+  }
+}
+
+/// Stops one child: an exit signal with reason shutdown, waiting up to the
+/// child's shutdown timeout for its exit, then a kill. Exit messages from
+/// other processes that arrive while waiting are buffered and returned.
+@target(native)
+fn shutdown_tracked(
+  pending: List(ExitMessage),
+  pid: Pid,
+  specification: ChildSpecification(Nil),
+) -> List(ExitMessage) {
+  let timeout = case specification.child_type {
+    supervision.Worker(shutdown_ms) -> shutdown_ms
+    supervision.Supervisor -> 5000
+  }
+  process.send_abnormal_exit(pid, "shutdown")
+  case await_exit(pending, pid, timeout) {
+    Ok(pending) -> pending
+    Error(pending) -> {
+      process.kill(pid)
+      case await_exit(pending, pid, 5000) {
+        Ok(pending) -> pending
+        Error(pending) -> pending
+      }
+    }
+  }
+}
+
+/// Waits for the exit message from a specific pid, buffering exits from
+/// other processes. `Ok` when it arrived, `Error` on timeout.
+@target(native)
+fn await_exit(
+  pending: List(ExitMessage),
+  pid: Pid,
+  timeout: Int,
+) -> Result(List(ExitMessage), List(ExitMessage)) {
+  let selector =
+    process.new_selector()
+    |> process.select_trapped_exits(fn(exit) { exit })
+  case process.selector_receive(selector, timeout) {
+    Ok(ExitMessage(from, _) as exit) ->
+      case from == pid {
+        True -> Ok(pending)
+        False -> await_exit(list.append(pending, [exit]), pid, timeout)
+      }
+    Error(Nil) -> Error(pending)
   }
 }

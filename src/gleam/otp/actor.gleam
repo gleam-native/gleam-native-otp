@@ -142,6 +142,7 @@
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom
 import gleam/erlang/charlist.{type Charlist}
+import gleam/io
 import gleam/erlang/process.{
   type ExitReason, type Pid, type Selector, type Subject, Abnormal, Killed,
 }
@@ -228,6 +229,11 @@ type Self(state, msg) {
     /// The selector that actor is currently using to reveive messages. This
     /// can be changed by the `Next` value returned by the actor's `loop` callback.
     selector: Selector(Message(msg)),
+    /// The running-mode selector — the user's selector wrapped with the
+    /// unexpected-message catch-all and the system-message handler —
+    /// prebuilt here so it is not reassembled for every message, and
+    /// rebuilt only when the user's selector is replaced.
+    full_selector: Selector(Message(msg)),
     /// An opaque value used by the OTP system debug APIs.
     debug_state: DebugState,
     /// The message handling code provided by the programmer.
@@ -416,30 +422,38 @@ fn receive_message(self: Self(state, msg)) -> Message(msg) {
       process.new_selector()
       |> select_system_messages
 
-    // When running we respond to all messages
-    Running ->
-      // The actor needs to handle various different messages:
-      //
-      // - OTP system messages. These are handled by the actor for the
-      //   programmer, they don't need to do anything.
-      // - Messages sent to the subject the actor creates during initialisation
-      //   and returns to the parent.
-      // - Any arbitrary messages the programmer expects the actor to receive.
-      //   For example, messages sent by a pubsub system where it does not
-      //   support using the actor's subject.
-      // - Any unexpected messages.
-      //
-      // We add the handler for unexpected messages first so that the user
-      // supplied selector can override it if desired.
-      process.new_selector()
-      |> process.select_other(Unexpected)
-      |> process.merge_selector(self.selector)
-      |> select_system_messages
+    // When running we respond to all messages, through the prebuilt
+    // selector.
+    Running -> self.full_selector
   }
 
   process.selector_receive_forever(selector)
 }
 
+/// The running-mode selector for a user selector: the actor needs to
+/// handle various different messages:
+///
+/// - OTP system messages. These are handled by the actor for the
+///   programmer, they don't need to do anything.
+/// - Messages sent to the subject the actor creates during initialisation
+///   and returns to the parent.
+/// - Any arbitrary messages the programmer expects the actor to receive.
+///   For example, messages sent by a pubsub system where it does not
+///   support using the actor's subject.
+/// - Any unexpected messages.
+///
+/// The handler for unexpected messages is added first so that the user
+/// supplied selector can override it if desired.
+fn full_selector(
+  selector: Selector(Message(msg)),
+) -> Selector(Message(msg)) {
+  process.new_selector()
+  |> process.select_other(Unexpected)
+  |> process.merge_selector(selector)
+  |> select_system_messages
+}
+
+@target(erlang)
 fn select_system_messages(
   selector: Selector(Message(msg)),
 ) -> Selector(Message(msg)) {
@@ -447,6 +461,16 @@ fn select_system_messages(
   |> process.select_record(atom.create("system"), 2, convert_system_message)
 }
 
+@target(native)
+fn select_system_messages(
+  selector: Selector(Message(msg)),
+) -> Selector(Message(msg)) {
+  // On the native target system messages are ordinary messages delivered
+  // under a reserved tag, sent by `gleam/otp/system`.
+  process.select_raw_tag(selector, process.system_message_tag, System)
+}
+
+@target(erlang)
 @external(erlang, "gleam_otp_external", "convert_system_message")
 fn convert_system_message(b: Dynamic) -> Message(msg)
 
@@ -501,21 +525,42 @@ fn loop(self: Self(state, msg)) -> ExitReason {
         Stop(reason) -> exit_process(reason)
 
         Continue(state: state, selector: new_selector) -> {
-          let selector = case new_selector {
-            None -> self.selector
-            Some(s) -> process.map_selector(s, Message)
+          let self = case new_selector {
+            None -> Self(..self, state: state)
+            Some(s) -> {
+              let selector = process.map_selector(s, Message)
+              Self(
+                ..self,
+                state: state,
+                selector: selector,
+                full_selector: full_selector(selector),
+              )
+            }
           }
-          loop(Self(..self, state: state, selector: selector))
+          loop(self)
         }
       }
   }
 }
 
 // TODO: replace this when we have Gleam bindings to the logger
+@target(erlang)
 @external(erlang, "logger", "warning")
 fn log_warning(a: Charlist, b: List(Charlist)) -> Nil
 
+@target(native)
+fn log_warning(a: Charlist, b: List(Charlist)) -> Nil {
+  let text =
+    charlist.to_string(a)
+    |> string.replace("~s", case b {
+      [argument, ..] -> charlist.to_string(argument)
+      [] -> ""
+    })
+  io.println_error(text)
+}
+
 @external(erlang, "gleam_otp_external", "identity")
+@external(native, "runtime", "gleam_native_identity")
 fn erase(a: anything) -> Dynamic
 
 // Run automatically when the actor is first started.
@@ -555,6 +600,7 @@ fn initialise_actor(
           state: state,
           parent:,
           selector: selector,
+          full_selector: full_selector(selector),
           message_handler: builder.on_message,
           debug_state: system.debug_state([]),
           mode: Running,
