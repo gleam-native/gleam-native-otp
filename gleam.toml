@@ -16,7 +16,7 @@ links = [
 ]
 
 [dependencies]
-gleam_stdlib = { path = "../gleam-stdlib-native" }
+gleam_stdlib = { path = "../gleam-native-stdlib" }
 gleam_erlang = { path = "../gleam-native-erlang" }
 
 [dev-dependencies]

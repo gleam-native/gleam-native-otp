@@ -8,11 +8,11 @@
 
 packages = [
   { name = "gleam_erlang", version = "1.3.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], source = "local", path = "../gleam-native-erlang" },
-  { name = "gleam_stdlib", version = "1.0.5", build_tools = ["gleam"], requirements = [], source = "local", path = "../gleam-stdlib-native" },
+  { name = "gleam_stdlib", version = "1.0.5", build_tools = ["gleam"], requirements = [], source = "local", path = "../gleam-native-stdlib" },
   { name = "gleeunit", version = "1.11.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], source = "local", path = "../gleam-native-gleeunit" },
 ]
 
 [requirements]
 gleam_erlang = { path = "../gleam-native-erlang" }
-gleam_stdlib = { path = "../gleam-stdlib-native" }
+gleam_stdlib = { path = "../gleam-native-stdlib" }
 gleeunit = { path = "../gleam-native-gleeunit" }
