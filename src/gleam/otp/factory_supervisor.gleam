@@ -237,13 +237,16 @@ pub fn named(
 }
 
 /// To prevent a supervisor from getting into an infinite loop of child
-/// process terminations and restarts, a maximum restart tolerance is
-/// defined using two integer values specified with keys intensity and
-/// period in the above map. Assuming the values MaxR for intensity and MaxT
-/// for period, then, if more than MaxR restarts occur within MaxT seconds,
+/// process terminations and restarts, supervisors have a maximum restart
+/// tolerance.
+///
+/// Intensity is the maximum number of restarts permitted, and period is the
+/// number of seconds the intensity is tracked within.
+///
+/// If more than `intensity` restarts occur within `period` seconds,
 /// the supervisor terminates all child processes and then itself. The
 /// termination reason for the supervisor itself in that case will be
-/// shutdown. 
+/// `shutdown`. 
 ///
 /// Intensity defaults to 2 and period defaults to 5.
 ///

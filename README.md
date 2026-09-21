@@ -11,7 +11,7 @@ to many of the core concepts of OTP, providing robust and type safe APIs for
 Gleam.
 
 This package is not a distinct OTP-inspired framework. The regular Erlang/OTP
-APIs can be use with and alongside this package without trouble.
+APIs can be used with and alongside this package without trouble.
 
 ```shell
 gleam add gleam_otp@1
